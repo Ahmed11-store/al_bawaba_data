@@ -1,0 +1,72 @@
+name: al_bawaba
+description: "البوابة - Al-Bawaba: offline Arabic voice license-plate inspection app"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State management
+  provider: ^6.1.2
+
+  # Offline local database
+  sqflite: ^2.3.3+1
+  path: ^1.9.0
+  path_provider: ^2.1.4
+
+  # Offline on-device speech recognition
+  speech_to_text: ^7.0.0
+
+  # Local audio playback (bundled asset only, no streaming)
+  audioplayers: ^6.0.0
+
+  # Haptic alert feedback
+  vibration: ^2.0.0
+
+  # On-device GPS
+  geolocator: ^13.0.1
+  url_launcher: ^6.3.1
+
+  # CSV / JSON import & export for the blacklist + logs
+  csv: ^6.0.0
+  file_picker: ^8.1.2
+  share_plus: ^10.0.2
+
+  # Offline monthly-subscription activation codes (HMAC signing +
+  # local persistence of device id / activation state)
+  crypto: ^3.0.5
+  shared_preferences: ^2.3.2
+
+  # Icons
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/audio/wanted_alert.wav
+    - assets/data/sample_blacklist.json
+
+  # NOTE: The design spec calls for Tajawal/Cairo. No font binaries
+  # are bundled here (can't ship third-party font files without the
+  # actual licensed .ttf assets). To add Tajawal:
+  #   1. Download the OFL-licensed Tajawal font family (fonts.google.com/specimen/Tajawal)
+  #   2. Drop the .ttf files into assets/fonts/
+  #   3. Uncomment the `fonts:` block below and re-point AppTheme.dark's
+  #      fontFamily (lib/core/app_theme.dart) from null back to 'Tajawal'
+  #
+  # fonts:
+  #   - family: Tajawal
+  #     fonts:
+  #       - asset: assets/fonts/Tajawal-Regular.ttf
+  #       - asset: assets/fonts/Tajawal-Bold.ttf
+  #         weight: 700

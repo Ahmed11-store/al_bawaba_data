@@ -1,0 +1,23 @@
+[
+  {
+    "letters": "رصل",
+    "digits": "8435",
+    "bank_name": "عبد اللطيف جميل",
+    "vehicle_model": "ACCENT",
+    "chassis_number": "MALC741B3PM386400"
+  },
+  {
+    "letters": "بكا",
+    "digits": "7407",
+    "bank_name": "الجزيرة للتقسيط",
+    "vehicle_model": "COROLLA",
+    "chassis_number": "JTDBR32E720123456"
+  },
+  {
+    "letters": "طهد",
+    "digits": "1122",
+    "bank_name": "الراجحي للتمويل",
+    "vehicle_model": "SONATA",
+    "chassis_number": "KMHEC4A40BA123789"
+  }
+]
