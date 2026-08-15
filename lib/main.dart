@@ -4,15 +4,23 @@ import 'package:provider/provider.dart';
 import 'core/app_theme.dart';
 import 'providers/inspection_provider.dart';
 import 'screens/app_gate.dart';
+import 'services/blacklist_sync_service.dart';
 import 'services/database_service.dart';
 import 'services/import_export_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // Deliberately not awaited-and-allowed-to-throw: see
-  // _seedSampleBlacklistIfEmpty's own try/catch below for why this
-  // must never be able to block runApp() from executing.
+  
+  // 1. تنزيل البيانات الأولية المحلية لو القاعدة فارغة
   await _seedSampleBlacklistIfEmpty();
+  
+  // 2. فحص ومزامنة التحديثات الجديدة تلقائياً من GitHub
+  try {
+    await BlacklistSyncService.instance.syncIfNeeded();
+  } catch (_) {
+    // في حالة عدم وجود إنترنت يتم فتح التطبيق عادي بالبيانات المحلية
+  }
+
   runApp(const AlBawabaApp());
 }
 
