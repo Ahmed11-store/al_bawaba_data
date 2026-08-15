@@ -49,13 +49,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/plate_record.dart';
 import 'database_service.dart';
-import 'update_service.dart' show kUpdateRepoOwner, kUpdateRepoName;
-
-/// Which branch `blacklist_sync.json` lives on and its path in the
-/// repo. Change kBlacklistSyncPath if you'd rather nest it in a
-/// folder (e.g. 'data/blacklist_sync.json').
-const String kBlacklistSyncBranch = 'main';
-const String kBlacklistSyncPath = 'blacklist_sync.json';
 
 class BlacklistSyncResult {
   final bool updated;
@@ -76,20 +69,16 @@ class BlacklistSyncService {
   static final BlacklistSyncService instance = BlacklistSyncService._internal();
 
   static const _kLastSyncedVersionKey = 'blacklist_sync_last_version_v1';
+  
+  // الرابط المباشر لملف الـ RAW على GitHub
+  static const String _syncUrl = 'https://raw.githubusercontent.com/Ahmed11-store/al_bawaba_data/refs/heads/main/blacklist_sync.json';
 
   /// Checks the remote file and, if it carries a higher "version"
   /// than what's already synced on this device, replaces the local
-  /// blacklist table with it. Always safe to call on every app
-  /// launch — no internet / an unchanged version / a malformed
-  /// response all just resolve to [BlacklistSyncResult.noChange]
-  /// rather than throwing, so a flaky connection can never disrupt
-  /// the app's offline-first operation.
+  /// blacklist table with it.
   Future<BlacklistSyncResult> syncIfNeeded() async {
     try {
-      final uri = Uri.https(
-        'raw.githubusercontent.com',
-        '/$kUpdateRepoOwner/$kUpdateRepoName/$kBlacklistSyncBranch/$kBlacklistSyncPath',
-      );
+      final uri = Uri.parse(_syncUrl);
       final response = await http.get(uri).timeout(const Duration(seconds: 8));
       if (response.statusCode != 200) return BlacklistSyncResult.noChange();
 
