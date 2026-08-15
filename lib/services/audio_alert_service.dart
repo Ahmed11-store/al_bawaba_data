@@ -48,6 +48,14 @@ class AudioAlertService {
   bool _alertActive = false;
   bool get isAlertActive => _alertActive;
 
+  /// Bumped on every trigger/dismiss. A play attempt that was
+  /// already in flight (still awaiting `_prepare()`/mic pause) when
+  /// dismiss() ran checks this before actually starting playback,
+  /// so a fast "إغلاق" tap can never be "raced" by a late-arriving
+  /// resume() call that would otherwise leave the alarm looping
+  /// with nothing left able to stop it.
+  int _alertGeneration = 0;
+
   final StreamController<bool> _alertActiveController =
       StreamController<bool>.broadcast();
 
@@ -59,13 +67,30 @@ class AudioAlertService {
   Stream<bool> get alertActiveStream => _alertActiveController.stream;
 
   Future<void> _prepare() async {
-    // AssetSource plays directly from the app bundle — no network
-    // I/O is possible through this code path.
-    await _player.setSource(AssetSource(_alertAssetPath));
-    await _player.setReleaseMode(ReleaseMode.loop);
+    // Manual looping instead of ReleaseMode.loop: on some Android /
+    // audioplayers combinations, calling stop() while the native
+    // player is mid-loop can be dropped by the platform layer, so
+    // the alarm keeps looping even after dismiss() runs. Looping at
+    // the Dart level via onPlayerComplete means every replay is a
+    // fresh decision this code makes, gated on _alertActive — stop()
+    // no longer has to win a race against a native auto-restart.
+    await _player.setReleaseMode(ReleaseMode.stop);
+    _completeSub ??= _player.onPlayerComplete.listen((_) {
+      if (_alertActive) {
+        unawaited(_player.play(AssetSource(_alertAssetPath)));
+      }
+    });
   }
 
-  bool _prepared = false;
+  StreamSubscription<void>? _completeSub;
+
+  /// Absolute ceiling: even if dismiss() is somehow never reached
+  /// (a bug we haven't found yet, an app-state edge case, anything),
+  /// the alarm still self-stops instead of requiring the operator to
+  /// force-close the whole app. This does not replace dismiss() —
+  /// it's a last-resort backstop underneath it.
+  static const Duration _maxAlertDuration = Duration(seconds: 45);
+  Timer? _autoStopTimer;
 
   /// Fires the full "تم رصد لوحة مطلوبة" alert sequence. Call this
   /// the moment the blacklist DB match returns a hit — before the
@@ -75,24 +100,34 @@ class AudioAlertService {
     if (_alertActive) return; // avoid overlapping alerts
     _alertActive = true;
     _alertActiveController.add(true);
+    final myGeneration = ++_alertGeneration;
 
     // 1. Pause the speech listener immediately so the alarm sound
     //    and any operator speech during the alert aren't picked
     //    back up as plate input.
     await _speechService.pause();
 
+    // Absolute backstop — see _maxAlertDuration above.
+    _autoStopTimer?.cancel();
+    _autoStopTimer = Timer(_maxAlertDuration, () {
+      if (_alertActive) dismiss();
+    });
+
     // 2 & 3. Play the local buzzer asset and vibrate, in parallel.
-    unawaited(_playAlarmLoop());
-    unawaited(_vibrateAlert());
+    unawaited(_playAlarmLoop(myGeneration));
+    unawaited(_vibrateAlert(myGeneration));
   }
 
-  Future<void> _playAlarmLoop() async {
+  Future<void> _playAlarmLoop(int generation) async {
     try {
-      if (!_prepared) {
-        await _prepare();
-        _prepared = true;
-      }
-      await _player.resume();
+      await _prepare();
+      // dismiss() may have already run while we were still
+      // preparing the player — don't start playback for an alert
+      // that's already been closed.
+      if (generation != _alertGeneration || !_alertActive) return;
+      // AssetSource plays directly from the app bundle — no network
+      // I/O is possible through this code path.
+      await _player.play(AssetSource(_alertAssetPath));
     } catch (_) {
       // Asset missing or codec unsupported on this device — fail
       // silently on audio so the visual alert modal (handled by
@@ -101,9 +136,10 @@ class AudioAlertService {
     }
   }
 
-  Future<void> _vibrateAlert() async {
+  Future<void> _vibrateAlert(int generation) async {
     final hasVibrator = await Vibration.hasVibrator();
     if (hasVibrator != true) return;
+    if (generation != _alertGeneration || !_alertActive) return;
     final hasCustom = await Vibration.hasCustomVibrationsSupport();
     if (hasCustom == true) {
       await Vibration.vibrate(pattern: kWantedPlateVibrationPattern);
@@ -111,6 +147,7 @@ class AudioAlertService {
       // Devices without custom pattern support: three discrete
       // vibrate calls approximating the same rhythm.
       for (final _ in [0, 1, 2]) {
+        if (generation != _alertGeneration || !_alertActive) return;
         await Vibration.vibrate(duration: 250);
         await Future.delayed(const Duration(milliseconds: 370));
       }
@@ -120,19 +157,40 @@ class AudioAlertService {
   /// Called when the operator taps the red "إغلاق" (close) button
   /// on the Alert Modal. Stops audio/vibration and resumes the
   /// offline voice listener.
+  ///
+  /// Deliberately unconditional: always bumps the generation token
+  /// and always calls stop()/cancel(), even if `_alertActive` was
+  /// somehow already false. Both calls are cheap/idempotent, and
+  /// this is what closes the race above rather than relying on
+  /// `_alertActive` alone to decide whether there's anything to
+  /// stop.
+  ///
+  /// Order matters: `_alertActive` is flipped to false BEFORE
+  /// `_player.stop()` is awaited, not after. The onPlayerComplete
+  /// handler in `_prepare()` re-plays the asset if `_alertActive` is
+  /// still true at the moment a playback cycle ends — if a cycle
+  /// happened to complete during the stop() call while the flag was
+  /// still true, that handler could fire and restart playback right
+  /// after stop() returned, leaving the alarm running with dismiss()
+  /// already having "succeeded".
   Future<void> dismiss() async {
-    if (!_alertActive) return;
+    _alertGeneration++; // invalidate any in-flight play/vibrate attempt
+    _autoStopTimer?.cancel();
+
+    final wasActive = _alertActive;
+    _alertActive = false;
 
     await _player.stop();
     Vibration.cancel();
 
-    _alertActive = false;
-    _alertActiveController.add(false);
+    if (wasActive) _alertActiveController.add(false);
 
     await _speechService.resume();
   }
 
   void dispose() {
+    _autoStopTimer?.cancel();
+    _completeSub?.cancel();
     _alertActiveController.close();
     _player.dispose();
   }

@@ -41,6 +41,12 @@ dependencies:
   crypto: ^3.0.5
   shared_preferences: ^2.3.2
 
+  # Update checker (compares installed version vs. latest GitHub
+  # release; download/install still requires the operator's tap —
+  # see update_service.dart for why that's an Android OS limit)
+  package_info_plus: ^8.0.2
+  http: ^1.2.2
+
   # Icons
   cupertino_icons: ^1.0.8
 

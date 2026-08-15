@@ -4,7 +4,10 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../core/app_theme.dart';
+import '../models/plate_record.dart';
 import '../providers/inspection_provider.dart';
+import '../services/database_service.dart';
+import '../services/import_export_service.dart';
 import '../services/speech_recognition_service.dart';
 import '../widgets/audio_level_meter.dart';
 import '../widgets/plate_data_table.dart';
@@ -19,6 +22,7 @@ class InspectionScreen extends StatefulWidget {
 
 class _InspectionScreenState extends State<InspectionScreen> {
   bool _alertDialogShowing = false;
+  bool _exporting = false;
   StreamSubscription<bool>? _alertSub;
 
   @override
@@ -48,16 +52,58 @@ class _InspectionScreenState extends State<InspectionScreen> {
     super.dispose();
   }
 
+  /// Saves everything read out during this session to a local CSV
+  /// file and opens the share sheet so the operator can keep it on
+  /// the phone (Files app, Drive, WhatsApp to themselves, etc.) —
+  /// separate from the "الكل" tab's export, which covers the full
+  /// historical log rather than just what's on screen right now.
+  Future<void> _exportSession() async {
+    if (_exporting) return;
+    final logs = context.read<InspectionProvider>().sessionLog;
+    if (logs.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('مفيش نتائج في الجلسة الحالية لحفظها')),
+      );
+      return;
+    }
+    setState(() => _exporting = true);
+    try {
+      await ImportExportService().exportLogsToCsv(
+        logs,
+        fileName: 'جلسة_فحص',
+      );
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Directionality(
       textDirection: TextDirection.rtl,
       child: Scaffold(
-        appBar: AppBar(title: const Text('البوابة - الفحص')),
+        appBar: AppBar(
+          title: const Text('البوابة - الفحص'),
+          actions: [
+            IconButton(
+              tooltip: 'حفظ نتائج الجلسة في ملف',
+              onPressed: _exporting ? null : _exportSession,
+              icon: _exporting
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.save_alt_rounded),
+            ),
+          ],
+        ),
         body: const Column(
           children: [
             _StatusHeader(),
+            _EngineErrorBanner(),
             _ModeToggleRow(),
+            _BlacklistPanel(),
             _AudioLevelRow(),
             Divider(color: AppColors.cardBorder, height: 1),
             _TableHeader(),
@@ -130,6 +176,236 @@ class _StatusHeader extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+/// Previously: if speech recognition failed to start (no offline
+/// Arabic language pack installed, mic permission denied/missing
+/// from AndroidManifest.xml, or the platform engine unavailable for
+/// any other reason), the "بدء" button would just silently revert
+/// to its idle state with zero explanation — indistinguishable from
+/// a broken microphone from the operator's point of view. This
+/// banner surfaces the actual cause so "بدء ومحصلش حاجة" stops
+/// being a silent failure.
+class _EngineErrorBanner extends StatelessWidget {
+  const _EngineErrorBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    return Selector<InspectionProvider, SpeechServiceStatus>(
+      selector: (_, p) => p.status,
+      builder: (context, status, _) {
+        if (status != SpeechServiceStatus.unavailable &&
+            status != SpeechServiceStatus.error) {
+          return const SizedBox.shrink();
+        }
+
+        final message = status == SpeechServiceStatus.unavailable
+            ? 'التعرف الصوتي أوفلاين مش متاح على الجهاز ده. الأسباب الشائعة: '
+                '(١) حزمة اللغة العربية للتعرف الصوتي أوفلاين مش منزّلة '
+                '(الإعدادات ← Google ← Voice ← On-device recognition ← نزّل العربية)، '
+                'أو (٢) إذن الميكروفون مرفوض للتطبيق '
+                '(إعدادات الجهاز ← التطبيقات ← البوابة ← الأذونات ← فعّل الميكروفون).'
+            : 'حصل خطأ في محرك التعرف الصوتي أثناء الاستماع. جرّب تدوس "بدء" تاني، '
+                'ولو المشكلة استمرت راجع إذن الميكروفون وحزمة اللغة العربية.';
+
+        return Container(
+          margin: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: AppColors.danger.withOpacity(0.12),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: AppColors.danger.withOpacity(0.4)),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Icon(Icons.error_outline_rounded,
+                  color: AppColors.danger, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  message,
+                  style: const TextStyle(color: AppColors.textPrimary, height: 1.5),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Lets the operator see the imported "wanted plates" list directly
+/// on the Inspection screen, not only in a separate tab. Collapsed
+/// by default (the table can hold thousands of rows and this
+/// screen's main job is the live scan session, not browsing the
+/// blacklist) — tap to expand and search.
+class _BlacklistPanel extends StatefulWidget {
+  const _BlacklistPanel();
+
+  @override
+  State<_BlacklistPanel> createState() => _BlacklistPanelState();
+}
+
+class _BlacklistPanelState extends State<_BlacklistPanel> {
+  bool _expanded = false;
+  Future<List<PlateRecord>>? _future;
+  Timer? _debounce;
+  final _searchController = TextEditingController();
+
+  void _toggle() {
+    setState(() {
+      _expanded = !_expanded;
+      if (_expanded && _future == null) {
+        _future = DatabaseService.instance.getBlacklist();
+      }
+    });
+  }
+
+  void _onSearchChanged(String value) {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 250), () {
+      setState(() {
+        _future = DatabaseService.instance.getBlacklist(search: value);
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      decoration: BoxDecoration(
+        color: AppColors.card,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.cardBorder),
+      ),
+      child: Column(
+        children: [
+          InkWell(
+            onTap: _toggle,
+            borderRadius: BorderRadius.circular(12),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              child: Row(
+                children: [
+                  const Icon(Icons.storage_rounded,
+                      color: AppColors.accentBlue, size: 18),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text('اللوحات المطلوبة المستوردة',
+                        style: TextStyle(color: AppColors.textPrimary)),
+                  ),
+                  Icon(
+                    _expanded
+                        ? Icons.keyboard_arrow_up_rounded
+                        : Icons.keyboard_arrow_down_rounded,
+                    color: AppColors.textSecondary,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_expanded) ...[
+            const Divider(color: AppColors.cardBorder, height: 1),
+            Padding(
+              padding: const EdgeInsets.all(10),
+              child: TextField(
+                controller: _searchController,
+                onChanged: _onSearchChanged,
+                style: const TextStyle(color: AppColors.textPrimary),
+                decoration: InputDecoration(
+                  hintText: 'ابحث بالحروف أو الأرقام...',
+                  hintStyle: const TextStyle(color: AppColors.textSecondary),
+                  isDense: true,
+                  filled: true,
+                  fillColor: AppColors.background,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: BorderSide.none,
+                  ),
+                ),
+              ),
+            ),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 220),
+              child: FutureBuilder<List<PlateRecord>>(
+                future: _future,
+                builder: (context, snapshot) {
+                  if (snapshot.connectionState == ConnectionState.waiting) {
+                    return const Padding(
+                      padding: EdgeInsets.all(16),
+                      child: Center(
+                        child: SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      ),
+                    );
+                  }
+                  final records = snapshot.data ?? [];
+                  if (records.isEmpty) {
+                    return const Padding(
+                      padding: EdgeInsets.all(16),
+                      child: Text(
+                        'لا توجد لوحات مطابقة',
+                        style: TextStyle(color: AppColors.textSecondary),
+                      ),
+                    );
+                  }
+                  return ListView.separated(
+                    shrinkWrap: true,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    itemCount: records.length,
+                    separatorBuilder: (_, __) =>
+                        const Divider(color: AppColors.cardBorder, height: 1),
+                    itemBuilder: (context, i) {
+                      final r = records[i];
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: Row(
+                          children: [
+                            Text(
+                              r.displayPlate,
+                              style: const TextStyle(
+                                color: AppColors.textPrimary,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const Spacer(),
+                            if (r.bankName.isNotEmpty)
+                              Flexible(
+                                child: Text(
+                                  r.bankName,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                      color: AppColors.textSecondary,
+                                      fontSize: 12),
+                                ),
+                              ),
+                          ],
+                        ),
+                      );
+                    },
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 6),
+          ],
+        ],
+      ),
     );
   }
 }
@@ -213,7 +489,8 @@ class _TableHeader extends StatelessWidget {
       padding: EdgeInsets.symmetric(horizontal: 22, vertical: 10),
       child: Row(
         children: [
-          SizedBox(width: 32, child: Text('#', style: style)),
+          SizedBox(width: 28), // aligns with the ✓/✗ icon in each row
+          SizedBox(width: 26, child: Text('#', style: style)),
           Expanded(
               flex: 2,
               child: Text('الحروف', style: style, textAlign: TextAlign.center)),

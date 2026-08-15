@@ -48,8 +48,13 @@ class _ActivationScreenState extends State<ActivationScreen> {
   }
 
   Future<void> _loadDeviceCode() async {
-    final code = await LicenseService.instance.getOrCreateDeviceCode();
-    if (mounted) setState(() => _deviceCode = code);
+    try {
+      final code = await LicenseService.instance.getOrCreateDeviceCode();
+      if (mounted) setState(() => _deviceCode = code);
+    } catch (_) {
+      // Leave the placeholder showing rather than crash — the
+      // operator can retry by reopening the app.
+    }
   }
 
   @override

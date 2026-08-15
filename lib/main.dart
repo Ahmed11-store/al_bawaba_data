@@ -9,6 +9,9 @@ import 'services/import_export_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Deliberately not awaited-and-allowed-to-throw: see
+  // _seedSampleBlacklistIfEmpty's own try/catch below for why this
+  // must never be able to block runApp() from executing.
   await _seedSampleBlacklistIfEmpty();
   runApp(const AlBawabaApp());
 }
@@ -18,14 +21,30 @@ void main() async {
 /// 50,000+ record file), load the small bundled demo dataset so
 /// the matching engine has something to demonstrate against.
 /// Safe to call every launch — it's a no-op once any data exists.
+///
+/// Wrapped in try/catch on purpose: this runs inside main(), before
+/// runApp() — an uncaught exception here (missing bundled asset, a
+/// native plugin not yet registered after adding a new dependency,
+/// a malformed sample file, anything) would stop the app before
+/// Flutter ever attaches a single frame. That's indistinguishable
+/// from a white screen that never goes away, and — unlike an error
+/// that happens after runApp() — there's no widget tree yet for an
+/// error screen to render into. Losing the demo seed data on a
+/// fresh install is a minor inconvenience the operator can recover
+/// from by importing their real file; failing to launch at all is
+/// not recoverable from inside the app.
 Future<void> _seedSampleBlacklistIfEmpty() async {
-  final db = DatabaseService.instance;
-  final count = await db.blacklistCount();
-  if (count > 0) return;
+  try {
+    final db = DatabaseService.instance;
+    final count = await db.blacklistCount();
+    if (count > 0) return;
 
-  final result = await ImportExportService().loadBundledSampleBlacklist();
-  if (result.records.isNotEmpty) {
-    await db.replaceBlacklist(result.records);
+    final result = await ImportExportService().loadBundledSampleBlacklist();
+    if (result.records.isNotEmpty) {
+      await db.replaceBlacklist(result.records);
+    }
+  } catch (_) {
+    // Intentionally swallowed — see doc comment above.
   }
 }
 

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../core/app_theme.dart';
 import '../models/plate_record.dart';
+import '../services/blacklist_sync_service.dart';
 import '../services/database_service.dart';
 
 /// Browse the imported "wanted plates" blacklist itself. Before
@@ -21,6 +22,7 @@ class _BlacklistScreenState extends State<BlacklistScreen> {
   late Future<List<PlateRecord>> _future;
   final _searchController = TextEditingController();
   Timer? _debounce;
+  bool _syncing = false;
 
   @override
   void initState() {
@@ -44,12 +46,50 @@ class _BlacklistScreenState extends State<BlacklistScreen> {
     });
   }
 
+  /// Manual on-demand pull — the automatic sync already runs on
+  /// every app launch (see app_gate.dart); this is just for testing
+  /// or when the operator doesn't want to wait for the next open.
+  Future<void> _syncNow() async {
+    if (_syncing) return;
+    setState(() => _syncing = true);
+    final result = await BlacklistSyncService.instance.syncIfNeeded();
+    if (!mounted) return;
+    setState(() {
+      _syncing = false;
+      _future = DatabaseService.instance.getBlacklist();
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          result.updated
+              ? 'تم التحديث: ${result.recordCount} لوحة.'
+              : 'مفيش تحديث جديد حاليًا.',
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Directionality(
       textDirection: TextDirection.rtl,
       child: Scaffold(
-        appBar: AppBar(title: const Text('اللوحات المطلوبة المستوردة')),
+        appBar: AppBar(
+          title: const Text('اللوحات المطلوبة المستوردة'),
+          actions: [
+            IconButton(
+              tooltip: 'تحديث الآن',
+              onPressed: _syncing ? null : _syncNow,
+              icon: _syncing
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.sync_rounded),
+            ),
+          ],
+        ),
         body: Column(
           children: [
             Padding(

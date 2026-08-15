@@ -52,6 +52,12 @@ class DatabaseService {
         // so historical logs stay intact even if a blacklist entry
         // is later removed/updated.
         await db.execute('PRAGMA foreign_keys = OFF');
+        // WAL lets reads (e.g. the live session's lookupPlate calls)
+        // proceed without blocking on a concurrent write (e.g. the
+        // background blacklist sync replacing the table) — matters
+        // once both can genuinely happen at the same time.
+        await db.execute('PRAGMA journal_mode = WAL');
+        await db.execute('PRAGMA synchronous = NORMAL');
       },
       onCreate: (db, version) async {
         await db.execute('''

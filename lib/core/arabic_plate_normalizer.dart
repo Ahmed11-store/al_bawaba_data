@@ -77,10 +77,11 @@ class PlateToken {
   });
 
   /// A plate is only "complete" and eligible for DB lookup once it
-  /// has at least one letter and a jurisdiction-appropriate digit
-  /// count. Adjust [minDigits]/[maxDigits] to match local plate
-  /// formats (Saudi plates: 3 letters + up to 4 digits).
-  bool isComplete({int minLetters = 1, int minDigits = 1, int maxDigits = 4}) {
+  /// has the jurisdiction's letter count and an appropriate digit
+  /// count. Default of 3 letters matches every example plate in
+  /// this project (sample_blacklist.json, README). Adjust
+  /// [minLetters]/[maxDigits] to match local plate formats.
+  bool isComplete({int minLetters = 3, int minDigits = 1, int maxDigits = 4}) {
     return letters.length >= minLetters &&
         digits.length >= minDigits &&
         digits.length <= maxDigits;
@@ -172,29 +173,95 @@ class ArabicPlateNormalizer {
   }
 
   /// Full pipeline: raw STT partial/final result -> [PlateToken].
-  /// Applies the grammar-constraint filter described in the spec:
-  /// only valid plate letters and digits survive; everything else
-  /// (filler words, unrelated vocabulary) is discarded.
-  PlateToken normalize(String rawRecognizedText) {
+  /// ---------------------------------------------------------------
+  /// Works at the WORD/TOKEN level, not the character level. This
+  /// matters: [kValidPlateLetters] covers almost the entire Arabic
+  /// alphabet, so a naive "keep every character that's a valid
+  /// plate letter" scan over the raw utterance ends up absorbing
+  /// the letters of ANY ordinary Arabic word the operator happens
+  /// to say — not just the dictated plate — since nearly every
+  /// Arabic word is, character-by-character, built only from
+  /// [kValidPlateLetters]. That was the source of extra/garbage
+  /// characters showing up in captured plates. Instead:
+  ///   - a token that's a known noise word is dropped
+  ///   - a token that's a spoken number word ("خمسة") becomes a digit
+  ///   - a token that's purely numeric ("8" or "8435") is kept as-is
+  ///   - a token that is exactly ONE Arabic letter (plates are meant
+  ///     to be dictated letter-by-letter, per this app's spec) is
+  ///     kept as a plate letter
+  ///   - a SHORT token (2–[maxFusedLetters] characters) made ENTIRELY
+  ///     of valid plate letters is also kept, as-is, as fused plate
+  ///     letters — see below for why this exists
+  ///   - anything else — real words, long multi-letter tokens, stray
+  ///     punctuation — is discarded, since it's not plate dictation
+  ///
+  /// Why the fused-token case exists: on-device Arabic dictation
+  /// engines routinely merge quickly-spoken individual letters into
+  /// one word-like chunk — an operator saying "ر... ص... ل..." can
+  /// easily come back from the engine as the single token "رصل"
+  /// instead of three space-separated single characters. Without
+  /// this case, every one of those letters was silently dropped
+  /// (each fused token failed the "exactly one letter" check and
+  /// fell into the discard bucket), which is what produced plates
+  /// with missing/wrong letters even when the operator dictated
+  /// correctly. This can't perfectly distinguish "three plate
+  /// letters said quickly" from "a genuine short Arabic word that
+  /// happens to be built only from plate-valid letters" — that
+  /// ambiguity is inherent to letter-by-letter dictation without a
+  /// plate-specific acoustic grammar (see the class doc comment
+  /// above re: swapping in a custom Vosk model). The length cap
+  /// keeps it from absorbing longer real words; kNoiseTokens keeps
+  /// common filler phrases out either way.
+  PlateToken normalize(String rawRecognizedText, {int maxFusedLetters = 6}) {
     final raw = rawRecognizedText;
 
     var text = convertDigitsToAscii(rawRecognizedText);
     text = normalizeLetterVariants(text);
-    text = stripNoiseAndSpokenNumbers(text);
 
     final letterBuffer = StringBuffer();
     final digitBuffer = StringBuffer();
+    final numericTokenPattern = RegExp(r'^[0-9]+$');
 
-    for (final rune in text.runes) {
-      final char = String.fromCharCode(rune);
-      if (kValidPlateLetters.contains(char)) {
-        letterBuffer.write(char);
-      } else if (RegExp(r'[0-9]').hasMatch(char)) {
-        digitBuffer.write(char);
+    bool isAllValidPlateLetters(String token) {
+      for (final rune in token.runes) {
+        if (!kValidPlateLetters.contains(String.fromCharCode(rune))) {
+          return false;
+        }
       }
-      // Anything else (spaces, stray punctuation, non-plate
-      // vocabulary that slipped through) is silently dropped —
-      // this IS the grammar constraint filter.
+      return true;
+    }
+
+    for (final rawToken in text.trim().split(RegExp(r'\s+'))) {
+      final token = rawToken.trim();
+      if (token.isEmpty) continue;
+      if (kNoiseTokens.contains(token)) continue;
+
+      final asDigit = kArabicNumberWords[token];
+      if (asDigit != null) {
+        digitBuffer.write(asDigit);
+        continue;
+      }
+
+      if (numericTokenPattern.hasMatch(token)) {
+        digitBuffer.write(token);
+        continue;
+      }
+
+      final letterCount = token.runes.length;
+      if (letterCount == 1 && kValidPlateLetters.contains(token)) {
+        letterBuffer.write(token);
+        continue;
+      }
+
+      if (letterCount >= 2 &&
+          letterCount <= maxFusedLetters &&
+          isAllValidPlateLetters(token)) {
+        letterBuffer.write(token);
+        continue;
+      }
+
+      // Long word, punctuation, or otherwise unrelated speech —
+      // intentionally not part of the plate. Dropped.
     }
 
     return PlateToken(

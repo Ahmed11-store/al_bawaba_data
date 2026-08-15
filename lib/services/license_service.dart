@@ -93,41 +93,58 @@ class LicenseService {
   /// The single source of truth the app should check at launch
   /// (and after every successful [activate]) to decide whether to
   /// show the main app or the activation screen.
+  ///
+  /// Wrapped defensively: this runs during app startup, before
+  /// anything else has rendered. If it throws — most commonly
+  /// because a native plugin (shared_preferences) hasn't been
+  /// re-registered after adding it without a full `flutter clean` —
+  /// the exception would otherwise propagate out of AppGate's
+  /// initState with no UI on screen yet to show an error, which is
+  /// exactly what an unhandled white screen looks like. Falling
+  /// back to "not activated" here means the operator sees the
+  /// activation screen (recoverable) instead of a blank app.
   Future<LicenseStatus> checkStatus() async {
-    final prefs = await _prefs;
-    final deviceCode = await getOrCreateDeviceCode();
-    final stored = prefs.getString(_kActivationCodeKey);
+    try {
+      final prefs = await _prefs;
+      final deviceCode = await getOrCreateDeviceCode();
+      final stored = prefs.getString(_kActivationCodeKey);
 
-    final lastSeen = await _bumpLastSeen();
+      final lastSeen = await _bumpLastSeen();
 
-    if (stored == null) {
+      if (stored == null) {
+        return const LicenseStatus(
+          isActive: false,
+          reason: 'لم يتم تفعيل الاشتراك بعد',
+        );
+      }
+
+      final expiry = _verifyAndDecode(stored, deviceCode);
+      if (expiry == null) {
+        // Shouldn't normally happen (we only ever store codes that
+        // verified at activation time) — but if the secret/algorithm
+        // ever changes, treat an unverifiable stored code as unset
+        // rather than crashing.
+        return const LicenseStatus(
+          isActive: false,
+          reason: 'كود التفعيل المحفوظ غير صالح، برجاء التفعيل من جديد',
+        );
+      }
+
+      if (lastSeen.isAfter(expiry)) {
+        return LicenseStatus(
+          isActive: false,
+          expiryDate: expiry,
+          reason: 'انتهت صلاحية الاشتراك',
+        );
+      }
+
+      return LicenseStatus(isActive: true, expiryDate: expiry);
+    } catch (_) {
       return const LicenseStatus(
         isActive: false,
-        reason: 'لم يتم تفعيل الاشتراك بعد',
+        reason: 'تعذر التحقق من التفعيل — أعد فتح التطبيق، ولو استمرت المشكلة أعد التفعيل',
       );
     }
-
-    final expiry = _verifyAndDecode(stored, deviceCode);
-    if (expiry == null) {
-      // Shouldn't normally happen (we only ever store codes that
-      // verified at activation time) — but if the secret/algorithm
-      // ever changes, treat an unverifiable stored code as unset
-      // rather than crashing.
-      return const LicenseStatus(
-        isActive: false,
-        reason: 'كود التفعيل المحفوظ غير صالح، برجاء التفعيل من جديد',
-      );
-    }
-
-    if (lastSeen.isAfter(expiry)) {
-      return LicenseStatus(
-        isActive: false,
-        expiryDate: expiry,
-        reason: 'انتهت صلاحية الاشتراك',
-      );
-    }
-
-    return LicenseStatus(isActive: true, expiryDate: expiry);
   }
 
   /// Anti-rollback clock guard: persists the latest device time

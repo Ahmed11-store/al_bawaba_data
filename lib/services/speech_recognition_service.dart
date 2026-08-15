@@ -68,11 +68,20 @@ class SpeechRecognitionService {
   bool _initialized = false;
   bool _sessionActive = false;
 
-  // Rolling buffer of the current utterance so partial results
-  // (STT engines fire many partials before a "final") accumulate
-  // into a single plate token instead of resetting each callback.
-  String _rollingBuffer = '';
-  Timer? _utteranceTimeoutTimer;
+  // Accumulates the plate currently being dictated, merged across
+  // BOTH partial-result callbacks AND engine restarts (see
+  // _ingest below for why restarts matter here). Cleared only on
+  // commit, on a genuine settle-timeout, or on pause/stop.
+  String _candidateLetters = '';
+  String _candidateDigits = '';
+  Timer? _settleTimer;
+
+  /// How long to wait with no new speech before treating the
+  /// accumulated candidate as finished and committing it. This is
+  /// intentionally the ONLY thing that triggers a commit — see
+  /// _ingest for why relying on the engine's own finalResult flag
+  /// caused fragmented readings.
+  static const Duration _settleDuration = Duration(milliseconds: 1600);
 
   /// Locale id for on-device Arabic recognition. Falls back
   /// through common Gulf/MSA locale ids depending on what the
@@ -163,8 +172,14 @@ class SpeechRecognitionService {
       // unavailability instead of silently phoning home.
       onDevice: true,
       cancelOnError: false,
-      listenFor: const Duration(minutes: 5),
-      pauseFor: const Duration(seconds: 8),
+      // Long ceilings so the OS restarts the underlying recognizer
+      // as rarely as possible; the platform still enforces its own
+      // internal caps (varies by OEM/Android version) regardless of
+      // what we request here, so _handleEngineStatus below is what
+      // actually keeps the mic open past that — this just minimizes
+      // how often that restart has to fire.
+      listenFor: const Duration(hours: 1),
+      pauseFor: const Duration(minutes: 3),
     );
   }
 
@@ -179,60 +194,98 @@ class SpeechRecognitionService {
 
   void _handleResult(SpeechRecognitionResult result) {
     if (_status == SpeechServiceStatus.paused) return;
-
-    _rollingBuffer = result.recognizedWords;
-    _armUtteranceTimeout();
-
-    if (result.finalResult) {
-      _evaluateBuffer(reset: true);
-      return;
-    }
-
-    // Also evaluate on partials: for rapid-fire plate dictation we
-    // don't want to wait for the engine's "final" flag (which can
-    // lag) once we already have a complete-looking plate token.
-    _evaluateBuffer(reset: false);
+    _ingest(result.recognizedWords);
   }
 
-  /// If no new partial arrives for a short window, treat the
-  /// buffer as done — handles engines that never fire finalResult
-  /// during continuous dictation mode.
-  void _armUtteranceTimeout() {
-    _utteranceTimeoutTimer?.cancel();
-    _utteranceTimeoutTimer = Timer(const Duration(milliseconds: 900), () {
-      _evaluateBuffer(reset: true);
-    });
+  /// Merges a new speech-engine hypothesis into the running
+  /// candidate plate instead of treating each result — or each
+  /// engine restart — as its own independent reading.
+  /// ---------------------------------------------------------------
+  /// Why this exists: Android's on-device recognizer segments a
+  /// continuous dictation into multiple separate "final" results
+  /// even with a long pauseFor configured (this is a real-device
+  /// behavior, not something the pauseFor/listenFor values in
+  /// _listenOnce fully control) — a genuinely long dictation
+  /// restarts the recognizer several times mid-plate. Committing on
+  /// every one of those was the exact bug that showed a single
+  /// spoken plate as several separate table rows with the digits
+  /// growing longer each time ("7", then "77", then "7742") — each
+  /// restart's fragment was being logged as if it were already a
+  /// complete, final plate.
+  ///
+  /// Instead: keep merging new fragments into [_candidateLetters]/
+  /// [_candidateDigits] across as many restarts as it takes, and
+  /// only commit once nothing new has arrived for [_settleDuration]
+  /// — that's the one and only commit trigger now (see
+  /// _commitCandidateIfComplete). The engine's own finalResult flag
+  /// is deliberately ignored for this decision; it fires too
+  /// eagerly/inconsistently on-device to be trusted here.
+  void _ingest(String rawText) {
+    if (rawText.trim().isEmpty) return;
+    final token = _normalizer.normalize(rawText);
+    if (token.letters.isEmpty && token.digits.isEmpty) return;
+
+    final sameDigitSequenceContinuing =
+        _candidateDigits.isNotEmpty && token.digits.startsWith(_candidateDigits);
+    final digitsConflict = token.digits.isNotEmpty &&
+        _candidateDigits.isNotEmpty &&
+        !sameDigitSequenceContinuing &&
+        !token.digits.startsWith(_candidateDigits);
+
+    if (digitsConflict) {
+      // The new fragment's digits don't extend what we already had
+      // — the operator has moved on to a new plate. Commit whatever
+      // candidate we were building (only takes effect if it was
+      // actually complete) before starting fresh.
+      _commitCandidateIfComplete();
+    }
+
+    if (token.letters.isNotEmpty) _candidateLetters = token.letters;
+    if (token.digits.isNotEmpty) _candidateDigits = token.digits;
+
+    _settleTimer?.cancel();
+    _settleTimer = Timer(_settleDuration, _commitCandidateIfComplete);
   }
 
-  void _evaluateBuffer({required bool reset}) {
-    if (_rollingBuffer.trim().isEmpty) return;
+  /// The single commit path — called only after [_settleDuration]
+  /// of true silence (no further fragments merged in), or when a
+  /// digit conflict signals a new plate has started. Always clears
+  /// the candidate, whether or not it ends up complete enough to
+  /// emit, so a garbled/partial reading can't linger and get
+  /// silently merged into whatever the operator says next.
+  void _commitCandidateIfComplete() {
+    _settleTimer?.cancel();
+    if (_candidateLetters.isEmpty && _candidateDigits.isEmpty) return;
 
-    final token = _normalizer.normalize(_rollingBuffer);
+    final letters = _candidateLetters;
+    final digits = _candidateDigits;
+    _candidateLetters = '';
+    _candidateDigits = '';
 
-    if (token.isComplete()) {
-      _plateController.add(
-        PlateDetection(token: token, detectedAt: DateTime.now()),
-      );
-      // A complete plate was emitted — clear the buffer so the
-      // next utterance starts fresh rather than re-emitting the
-      // same plate on every subsequent partial.
-      _rollingBuffer = '';
-      return;
-    }
+    final token = PlateToken(
+      letters: letters,
+      digits: digits,
+      raw: '$letters $digits'.trim(),
+    );
+    if (!token.isComplete()) return;
 
-    if (reset) {
-      _rollingBuffer = '';
-    }
+    _plateController.add(
+      PlateDetection(token: token, detectedAt: DateTime.now()),
+    );
   }
 
   /// Pauses recognition without tearing down the engine session —
   /// used while the "لوحة مطلوبة" alert modal is on screen so the
   /// mic doesn't pick up the alarm sound / operator speech as
-  /// plate input.
+  /// plate input. Discards (doesn't commit) any in-flight candidate
+  /// — a pause here always follows a just-committed complete plate
+  /// triggering the alert, never a mid-utterance interruption.
   Future<void> pause() async {
     if (_status != SpeechServiceStatus.listening) return;
     _updateStatus(SpeechServiceStatus.paused);
-    _rollingBuffer = '';
+    _settleTimer?.cancel();
+    _candidateLetters = '';
+    _candidateDigits = '';
     await _speech.stop();
   }
 
@@ -247,21 +300,43 @@ class SpeechRecognitionService {
   /// Fully stops the session ("إيقاف الجلسة الصوتية").
   Future<void> stopSession() async {
     _sessionActive = false;
-    _utteranceTimeoutTimer?.cancel();
-    _rollingBuffer = '';
+    _settleTimer?.cancel();
+    _candidateLetters = '';
+    _candidateDigits = '';
     await _speech.stop();
     _updateStatus(SpeechServiceStatus.idle);
   }
 
   void _handleEngineStatus(String platformStatus) {
-    // speech_to_text auto-stops after `listenFor`/`pauseFor`
-    // elapses; re-arm continuous listening if the session is
-    // still meant to be active and we weren't explicitly paused.
+    // speech_to_text auto-stops after `listenFor`/`pauseFor` elapses
+    // (or the OS enforces its own internal cap regardless of what
+    // we requested). Re-arm immediately unless the operator
+    // explicitly stopped/paused the session or the engine is in an
+    // error/unavailable state — this is what makes "بدء" behave as
+    // "stays open until I press إيقاف" instead of silently dying
+    // after the first OS-level timeout.
     if (platformStatus == 'done' || platformStatus == 'notListening') {
-      if (_sessionActive && _status == SpeechServiceStatus.listening) {
+      _maybeRestart();
+    }
+  }
+
+  /// Restarts listening if the session is still meant to be active.
+  /// A short settle delay avoids a known platform quirk: calling
+  /// listen() again in the exact same tick as the previous session's
+  /// 'done'/'notListening' callback can be silently dropped on some
+  /// Android OEM builds, which is what used to make the mic look
+  /// like it "closed" without the operator ever pressing إيقاف.
+  void _maybeRestart() {
+    if (!_sessionActive) return;
+    if (_status == SpeechServiceStatus.paused) return;
+    if (_status == SpeechServiceStatus.error) return;
+    if (_status == SpeechServiceStatus.unavailable) return;
+
+    Timer(const Duration(milliseconds: 200), () {
+      if (_sessionActive && _status != SpeechServiceStatus.paused) {
         _listenOnce();
       }
-    }
+    });
   }
 
   void _handleEngineError(SpeechRecognitionError error) {
@@ -272,9 +347,7 @@ class SpeechRecognitionService {
       _updateStatus(SpeechServiceStatus.error);
       return;
     }
-    if (_sessionActive) {
-      _listenOnce();
-    }
+    _maybeRestart();
   }
 
   void _updateStatus(SpeechServiceStatus status) {
@@ -283,7 +356,7 @@ class SpeechRecognitionService {
   }
 
   void dispose() {
-    _utteranceTimeoutTimer?.cancel();
+    _settleTimer?.cancel();
     _statusController.close();
     _plateController.close();
     _audioLevelController.close();

@@ -46,8 +46,14 @@ class PlateDataTable extends StatelessWidget {
           ),
           child: Row(
             children: [
+              Icon(
+                isWanted ? Icons.cancel_rounded : Icons.check_circle_rounded,
+                color: isWanted ? AppColors.danger : AppColors.success,
+                size: 22,
+              ),
+              const SizedBox(width: 6),
               SizedBox(
-                width: 32,
+                width: 26,
                 child: Text('#$rowNumber',
                     style: const TextStyle(color: AppColors.textSecondary)),
               ),
@@ -85,14 +91,29 @@ class PlateDataTable extends StatelessWidget {
                         .withOpacity(0.15),
                     borderRadius: BorderRadius.circular(20),
                   ),
-                  child: Text(
-                    log.status.arabicLabel,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: isWanted ? AppColors.danger : AppColors.success,
-                      fontWeight: FontWeight.w700,
-                      fontSize: 12,
-                    ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        isWanted
+                            ? Icons.close_rounded
+                            : Icons.check_rounded,
+                        color: isWanted ? AppColors.danger : AppColors.success,
+                        size: 14,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        log.status.arabicLabel,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color:
+                              isWanted ? AppColors.danger : AppColors.success,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
